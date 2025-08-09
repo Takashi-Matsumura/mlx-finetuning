@@ -146,8 +146,10 @@ class OllamaIntegrator:
             }
         
         try:
-            # 一時的なModelfileを作成
-            modelfile_content = f"FROM {gguf_path}\n\n"
+            # 一時的なModelfileを作成（絶対パス使用）
+            from pathlib import Path
+            absolute_gguf_path = Path(gguf_path).resolve()
+            modelfile_content = f"FROM {absolute_gguf_path}\n\n"
             
             # システムプロンプト
             if system_prompt:

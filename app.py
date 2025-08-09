@@ -7,6 +7,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
 import logging
+import tarfile
+import shutil
 from datetime import datetime
 
 # プロジェクトのソースコードをインポート
@@ -17,6 +19,189 @@ from src.ollama_integration import OllamaIntegrator
 from src.experiment_tracker import ExperimentTracker
 from src.utils.memory_monitor import MemoryMonitor
 from src.utils.validators import validate_all
+from typing import Dict, Any, List
+
+
+def create_transfer_archive(experiment_id: str, output_name: str) -> Dict[str, Any]:
+    """転送用アーカイブを作成"""
+    try:
+        # パス設定
+        finetuned_dir = Path(f"./models/finetuned/{experiment_id}")
+        quantized_dir = Path("./models/quantized")
+        experiments_dir = Path(f"./experiments/{experiment_id}")
+        output_path = Path(f"./{output_name}.tar.gz")
+        
+        # 必要なファイルを確認
+        required_files = []
+        
+        # 1. LoRAアダプター
+        adapters_file = finetuned_dir / "adapters.safetensors"
+        if adapters_file.exists():
+            required_files.append(("models/finetuned", adapters_file))
+        
+        # 2. アダプター設定
+        adapter_config = finetuned_dir / "adapter_config.json"
+        if adapter_config.exists():
+            required_files.append(("models/finetuned", adapter_config))
+        
+        # 3. 量子化ファイルを探す
+        gguf_file = None
+        
+        # まず、MLXモデルディレクトリからIDを取得
+        mlx_model_dir = None
+        for mlx_dir in finetuned_dir.glob("mlx_model_*"):
+            mlx_model_dir = mlx_dir
+            break
+        
+        if mlx_model_dir and mlx_model_dir.exists():
+            # MLXモデルIDを抽出
+            mlx_id = mlx_model_dir.name.replace("mlx_model_", "")
+            
+            # Q5_K_M量子化ファイルを優先的に探す
+            for priority_suffix in ["-Q5_K_M.gguf", "-Q4_K_M.gguf", ".gguf"]:
+                candidate_file = quantized_dir / f"mlx_model_{mlx_id}{priority_suffix}"
+                if candidate_file.exists():
+                    gguf_file = candidate_file
+                    break
+            
+            # それでも見つからない場合は、glob検索
+            if not gguf_file:
+                for gguf_path in quantized_dir.glob(f"*{mlx_id}*.gguf"):
+                    gguf_file = gguf_path
+                    break
+        
+        if gguf_file and gguf_file.exists():
+            required_files.append(("models/quantized", gguf_file))
+        
+        # 4. 実験設定
+        exp_info = experiments_dir / "experiment_info.json"
+        if exp_info.exists():
+            required_files.append(("experiments", exp_info))
+        
+        if not required_files:
+            return {
+                'success': False,
+                'error': f'実験 {experiment_id} の必要ファイルが見つかりません'
+            }
+        
+        # アーカイブ作成
+        with tarfile.open(output_path, 'w:gz') as tar:
+            for category, file_path in required_files:
+                # アーカイブ内での相対パス
+                if category == "models/finetuned":
+                    arcname = f"models/finetuned/{experiment_id}/{file_path.name}"
+                elif category == "models/quantized":
+                    arcname = f"models/quantized/{file_path.name}"
+                elif category == "experiments":
+                    arcname = f"experiments/{experiment_id}/{file_path.name}"
+                
+                tar.add(file_path, arcname=arcname)
+        
+        # ファイルサイズ
+        size_mb = output_path.stat().st_size / (1024**2)
+        
+        return {
+            'success': True,
+            'archive_path': str(output_path.absolute()),
+            'filename': output_path.name,
+            'size_mb': size_mb,
+            'gguf_filename': gguf_file.name if gguf_file else 'model.gguf',
+            'files_included': len(required_files)
+        }
+        
+    except Exception as e:
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
+def get_cleanup_info() -> Dict[str, float]:
+    """クリーンアップ対象のストレージ情報を取得"""
+    
+    def get_dir_size(path: Path) -> float:
+        """ディレクトリサイズをGB単位で取得"""
+        if not path.exists():
+            return 0.0
+        
+        total_size = 0
+        try:
+            for file_path in path.rglob('*'):
+                if file_path.is_file():
+                    total_size += file_path.stat().st_size
+        except (OSError, PermissionError):
+            pass
+        
+        return total_size / (1024**3)
+    
+    return {
+        'finetuned_size_gb': get_dir_size(Path("./models/finetuned")),
+        'quantized_size_gb': get_dir_size(Path("./models/quantized")),
+        'experiments_size_gb': get_dir_size(Path("./experiments")),
+        'mlx_cache_size_gb': get_dir_size(Path("./models/cache")),
+        'gguf_cache_size_gb': get_dir_size(Path("./models/gguf_cache"))
+    }
+
+
+def perform_cleanup(cleanup_options: List[str]) -> Dict[str, Any]:
+    """クリーンアップを実行"""
+    try:
+        total_freed = 0.0
+        
+        # クリーンアップ前のサイズ記録
+        cleanup_info_before = get_cleanup_info()
+        
+        for option in cleanup_options:
+            if "ファインチューニング結果" in option:
+                target_dir = Path("./models/finetuned")
+                if target_dir.exists():
+                    total_freed += cleanup_info_before['finetuned_size_gb']
+                    shutil.rmtree(target_dir)
+                    target_dir.mkdir(exist_ok=True)
+            
+            elif "量子化ファイル" in option:
+                target_dir = Path("./models/quantized")
+                if target_dir.exists():
+                    total_freed += cleanup_info_before['quantized_size_gb']
+                    shutil.rmtree(target_dir)
+                    target_dir.mkdir(exist_ok=True)
+            
+            elif "実験データ" in option:
+                target_dir = Path("./experiments")
+                if target_dir.exists():
+                    total_freed += cleanup_info_before['experiments_size_gb']
+                    # metadata ファイルは保持
+                    for item in target_dir.iterdir():
+                        if item.is_dir():
+                            shutil.rmtree(item)
+                        elif item.name != "experiments_metadata.json":
+                            item.unlink()
+            
+            elif "MLXキャッシュ" in option:
+                target_dir = Path("./models/cache")
+                if target_dir.exists():
+                    total_freed += cleanup_info_before['mlx_cache_size_gb']
+                    shutil.rmtree(target_dir)
+                    target_dir.mkdir(exist_ok=True)
+            
+            elif "GGUFキャッシュ" in option:
+                target_dir = Path("./models/gguf_cache")
+                if target_dir.exists():
+                    total_freed += cleanup_info_before['gguf_cache_size_gb']
+                    shutil.rmtree(target_dir)
+                    target_dir.mkdir(exist_ok=True)
+        
+        return {
+            'success': True,
+            'freed_gb': total_freed
+        }
+        
+    except Exception as e:
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
 
 # ページ設定
 st.set_page_config(
@@ -35,6 +220,179 @@ if 'training_manager' not in st.session_state:
     st.session_state['training_manager'] = None
 if 'current_experiment_id' not in st.session_state:
     st.session_state['current_experiment_id'] = None
+
+
+def get_disk_usage():
+    """ディスク使用量を取得"""
+    import shutil
+    
+    try:
+        total, used, free = shutil.disk_usage(".")
+        
+        total_gb = total / (1024**3)
+        used_gb = used / (1024**3) 
+        free_gb = free / (1024**3)
+        usage_percent = (used / total) * 100
+        
+        return {
+            'total_gb': total_gb,
+            'used_gb': used_gb,
+            'free_gb': free_gb,
+            'usage_percent': usage_percent
+        }
+    except Exception as e:
+        logger.error(f"ディスク使用量取得エラー: {e}")
+        return {
+            'total_gb': 0,
+            'used_gb': 0,
+            'free_gb': 0,
+            'usage_percent': 0
+        }
+
+
+def cleanup_docker():
+    """Dockerのクリーンアップを実行"""
+    import subprocess
+    
+    try:
+        with st.spinner("🐳 Dockerクリーンアップ実行中..."):
+            results = []
+            
+            # 未使用イメージを削除
+            result = subprocess.run(
+                ["docker", "image", "prune", "-a", "-f"],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                results.append(f"Images: {result.stdout.split('Total reclaimed space: ')[-1].strip()}")
+            
+            # 未使用コンテナを削除
+            result = subprocess.run(
+                ["docker", "container", "prune", "-f"],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0 and "Total reclaimed space: " in result.stdout:
+                results.append(f"Containers: {result.stdout.split('Total reclaimed space: ')[-1].strip()}")
+            
+            # 未使用ボリュームを削除
+            result = subprocess.run(
+                ["docker", "volume", "prune", "-f"],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0 and "Total reclaimed space: " in result.stdout:
+                results.append(f"Volumes: {result.stdout.split('Total reclaimed space: ')[-1].strip()}")
+            
+            # ビルドキャッシュを削除
+            result = subprocess.run(
+                ["docker", "builder", "prune", "-a", "-f"],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0 and "Total:" in result.stdout:
+                cache_size = result.stdout.split("Total:")[-1].strip()
+                results.append(f"Build Cache: {cache_size}")
+            
+            if results:
+                st.success(f"✅ Dockerクリーンアップ完了!\n\n" + "\n".join(results))
+            else:
+                st.info("ℹ️ クリーンアップ対象のDockerリソースはありませんでした")
+                
+    except FileNotFoundError:
+        st.warning("⚠️ Dockerが見つかりません。Dockerがインストールされているか確認してください。")
+    except Exception as e:
+        st.error(f"❌ Dockerクリーンアップエラー: {e}")
+
+
+def cleanup_temp_files():
+    """一時ファイルのクリーンアップを実行"""
+    import subprocess
+    
+    try:
+        with st.spinner("🗂️ 一時ファイル削除中..."):
+            deleted_files = 0
+            
+            # プロジェクト内の一時ファイルを削除
+            temp_patterns = [
+                "*.log", "*.tmp", "__pycache__", ".DS_Store", 
+                "*.pyc", ".pytest_cache", ".coverage"
+            ]
+            
+            for pattern in temp_patterns:
+                result = subprocess.run(
+                    ["find", ".", "-name", pattern, "-type", "f", "-delete"],
+                    capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    # ファイル数をカウント（概算）
+                    count_result = subprocess.run(
+                        ["find", ".", "-name", pattern, "-type", "f"],
+                        capture_output=True, text=True
+                    )
+                    deleted_files += len([l for l in count_result.stdout.split('\n') if l.strip()])
+            
+            # システムの一時ディレクトリもクリーンアップ（安全な範囲で）
+            subprocess.run(["rm", "-rf", "/tmp/streamlit-*"], capture_output=True)
+            subprocess.run(["rm", "-rf", "/tmp/mlx_*"], capture_output=True)
+            
+            st.success(f"✅ 一時ファイル削除完了! 約{deleted_files}個のファイルを処理しました")
+            
+    except Exception as e:
+        st.error(f"❌ 一時ファイル削除エラー: {e}")
+
+
+def cleanup_quantization_files():
+    """量子化関連の不要ファイルをクリーンアップ"""
+    try:
+        with st.spinner("📦 量子化ファイル整理中..."):
+            cleaned_size = 0
+            
+            # models/quantizedディレクトリの破損ファイルを確認・削除
+            quantized_dir = Path("./models/quantized")
+            if quantized_dir.exists():
+                for file in quantized_dir.glob("*.gguf"):
+                    try:
+                        # GGUFファイルの簡易チェック（最初の4バイトがGGUF）
+                        with open(file, 'rb') as f:
+                            header = f.read(4)
+                            if header != b'GGUF':
+                                file_size = file.stat().st_size / (1024**3)  # GB
+                                file.unlink()
+                                cleaned_size += file_size
+                                st.warning(f"破損ファイルを削除: {file.name}")
+                    except Exception:
+                        # 読み取りできないファイルも削除
+                        try:
+                            file_size = file.stat().st_size / (1024**3)
+                            file.unlink()
+                            cleaned_size += file_size
+                            st.warning(f"アクセス不可ファイルを削除: {file.name}")
+                        except:
+                            pass
+            
+            # MLXのキャッシュディレクトリをクリーンアップ
+            mlx_cache_dirs = [
+                Path("./models/cache"),
+                Path("./models/.cache"),
+                Path("~/.cache/mlx").expanduser(),
+                Path("~/.cache/huggingface").expanduser()
+            ]
+            
+            for cache_dir in mlx_cache_dirs:
+                if cache_dir.exists():
+                    try:
+                        import shutil
+                        dir_size = sum(f.stat().st_size for f in cache_dir.rglob('*') if f.is_file()) / (1024**3)
+                        shutil.rmtree(cache_dir, ignore_errors=True)
+                        cleaned_size += dir_size
+                    except:
+                        pass
+            
+            if cleaned_size > 0:
+                st.success(f"✅ 量子化ファイル整理完了! {cleaned_size:.2f}GB削除しました")
+            else:
+                st.info("ℹ️ クリーンアップ対象の量子化ファイルはありませんでした")
+                
+    except Exception as e:
+        st.error(f"❌ 量子化ファイル整理エラー: {e}")
 
 
 def load_config():
@@ -154,12 +512,46 @@ def dataset_page():
     """データセット準備ページ"""
     st.title("📊 データセット準備")
     
-    # ファイルアップロード
-    uploaded_file = st.file_uploader(
-        "データファイルをアップロード",
-        type=['csv', 'json', 'jsonl', 'txt'],
-        help="CSV、JSON、JSONL、TXTファイルに対応"
-    )
+    # サンプルファイル選択オプション
+    st.subheader("📁 ファイル選択")
+    
+    # data/templatesディレクトリのサンプルファイル一覧を取得
+    templates_dir = Path("./data/templates")
+    sample_files = []
+    if templates_dir.exists():
+        for ext in ['*.csv', '*.json', '*.jsonl', '*.txt']:
+            sample_files.extend(templates_dir.glob(ext))
+    
+    tab1, tab2 = st.tabs(["📂 サンプルファイル", "📤 ファイルアップロード"])
+    
+    selected_file_path = None
+    
+    with tab1:
+        if sample_files:
+            st.write("data/templatesディレクトリのサンプルファイル:")
+            sample_file_names = [str(f.name) for f in sample_files]
+            selected_sample = st.selectbox(
+                "サンプルファイルを選択:",
+                options=[""] + sample_file_names,
+                help="data/templatesディレクトリにあるサンプルファイルから選択"
+            )
+            
+            if selected_sample:
+                selected_file_path = str(templates_dir / selected_sample)
+                st.success(f"選択されたファイル: {selected_sample}")
+        else:
+            st.info("data/templatesディレクトリにサンプルファイルが見つかりません")
+    
+    with tab2:
+        # ファイルアップロード
+        uploaded_file = st.file_uploader(
+            "データファイルをアップロード",
+            type=['csv', 'json', 'jsonl', 'txt'],
+            help="CSV、JSON、JSONL、TXTファイルに対応"
+        )
+    
+    # ファイル処理（アップロードまたはサンプルファイル選択）
+    processed_file_path = None
     
     if uploaded_file is not None:
         # 一時ファイルに保存
@@ -170,11 +562,16 @@ def dataset_page():
             f.write(uploaded_file.getbuffer())
         
         st.success(f"ファイルアップロード完了: {uploaded_file.name}")
+        processed_file_path = temp_path
         
+    elif selected_file_path:
+        processed_file_path = selected_file_path
+    
+    if processed_file_path:
         # データプレビュー
         try:
             processor = DatasetProcessor()
-            df = processor.load_dataset(temp_path)
+            df = processor.load_dataset(processed_file_path)
             
             st.subheader("📋 データプレビュー")
             preview_info = processor.get_preview(df)
@@ -241,10 +638,12 @@ def dataset_page():
                     
                     processor_with_config = DatasetProcessor(config)
                     
-                    output_dir = f"./data/processed/{uploaded_file.name.split('.')[0]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    # ファイル名から拡張子を除いた部分を取得
+                    base_filename = Path(processed_file_path).stem
+                    output_dir = f"./data/processed/{base_filename}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                     
                     result = processor_with_config.process_dataset(
-                        temp_path,
+                        processed_file_path,
                         output_dir,
                         task_type,
                         custom_template,
@@ -293,14 +692,25 @@ def training_page():
     st.subheader("🤖 モデル選択")
     
     model_options = {}
+    default_model = None
     if 'base_models' in models_config:
         for key, model_info in models_config['base_models'].items():
             model_options[model_info['name']] = model_info['display_name']
+            # Gemma2:2bをデフォルトに設定
+            if key == 'gemma2-2b':
+                default_model = model_info['name']
+    
+    # デフォルトモデルのインデックスを取得
+    default_index = 0
+    if default_model and default_model in model_options:
+        default_index = list(model_options.keys()).index(default_model)
     
     selected_model = st.selectbox(
         "ベースモデル",
         options=list(model_options.keys()),
-        format_func=lambda x: model_options.get(x, x)
+        index=default_index,
+        format_func=lambda x: model_options.get(x, x),
+        help="推奨: Gemma 2 2B Instruct (軽量で高速)"
     )
     
     if selected_model and selected_model in [info['name'] for info in models_config.get('base_models', {}).values()]:
@@ -320,6 +730,8 @@ def training_page():
     st.subheader("📊 データセット選択")
     
     processed_data_dir = Path("./data/processed")
+    st.info(f"📁 処理済みデータセットの保存場所: `{processed_data_dir.resolve()}`")
+    
     if processed_data_dir.exists():
         dataset_dirs = [d for d in processed_data_dir.iterdir() if d.is_dir()]
         
@@ -327,22 +739,110 @@ def training_page():
             selected_dataset_dir = st.selectbox(
                 "処理済みデータセット",
                 options=dataset_dirs,
-                format_func=lambda x: x.name
+                format_func=lambda x: x.name,
+                help="データセット準備で作成された処理済みデータセットから選択"
             )
             
             # データセット情報表示
             if selected_dataset_dir:
+                st.write(f"**選択されたディレクトリ**: `{selected_dataset_dir}`")
+                
                 train_file = selected_dataset_dir / "train.jsonl"
+                val_file = selected_dataset_dir / "val.jsonl"
+                test_file = selected_dataset_dir / "test.jsonl"
+                
+                col1, col2, col3 = st.columns(3)
+                
                 if train_file.exists():
                     with open(train_file, 'r') as f:
                         train_count = sum(1 for _ in f)
-                    st.info(f"📊 訓練データ: {train_count:,} 件")
+                    with col1:
+                        st.metric("📊 訓練データ", f"{train_count:,} 件")
+                
+                if val_file.exists():
+                    with open(val_file, 'r') as f:
+                        val_count = sum(1 for _ in f)
+                    with col2:
+                        st.metric("📊 検証データ", f"{val_count:,} 件")
+                
+                if test_file.exists():
+                    with open(test_file, 'r') as f:
+                        test_count = sum(1 for _ in f)
+                    with col3:
+                        st.metric("📊 テストデータ", f"{test_count:,} 件")
         else:
             st.warning("処理済みデータセットがありません。先にデータセット準備を行ってください。")
             selected_dataset_dir = None
     else:
         st.warning("データディレクトリが存在しません。")
         selected_dataset_dir = None
+    
+    # モデルファイル配置手順
+    st.subheader("📁 モデルファイル配置")
+    
+    with st.expander("モデルファイルの準備手順", expanded=True):
+        st.info("""
+        **このアプリはローカルのモデルファイルを使用します。以下の手順でファイルを配置してください：**
+        """)
+        
+        # モデルファイル配置状況の確認
+        gemma_path = Path("./models/gemma-2-2b-it")
+        elyza_path = Path("./models/Llama-3-ELYZA-JP-8B")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("**🤖 Gemma 2 2B Instruct**")
+            if gemma_path.exists():
+                required_files = ["config.json", "model.safetensors.index.json"]
+                safetensors_files = list(gemma_path.glob("model-*.safetensors"))
+                tokenizer_files = [f for f in ["tokenizer.json", "tokenizer.model"] if (gemma_path / f).exists()]
+                
+                all_required_exist = all((gemma_path / f).exists() for f in required_files)
+                has_tokenizer = len(tokenizer_files) > 0
+                has_model_files = len(safetensors_files) > 0
+                
+                if all_required_exist and has_tokenizer and has_model_files:
+                    st.success("✅ ファイル配置完了")
+                    st.write(f"📊 モデルファイル数: {len(safetensors_files)}")
+                else:
+                    st.error("❌ ファイル不足")
+                    missing = []
+                    if not all_required_exist:
+                        missing.extend([f for f in required_files if not (gemma_path / f).exists()])
+                    if not has_tokenizer:
+                        missing.append("tokenizer files")
+                    if not has_model_files:
+                        missing.append("model-*.safetensors")
+                    st.write(f"不足ファイル: {', '.join(missing)}")
+            else:
+                st.warning("⚠️ ディレクトリなし")
+                st.code(f"配置先: {gemma_path.absolute()}")
+        
+        with col2:
+            st.write("**🗾 ELYZA Japanese 8B**")
+            if elyza_path.exists():
+                st.success("✅ ファイル配置完了")
+            else:
+                st.warning("⚠️ ディレクトリなし") 
+                st.code(f"配置先: {elyza_path.absolute()}")
+        
+        st.markdown("""
+        ### 📥 ファイル入手方法:
+        
+        #### **Gemma 2 2B Instruct**:
+        1. [HuggingFace](https://huggingface.co/google/gemma-2-2b-it) からダウンロード
+        2. 以下のディレクトリに配置: `./models/gemma-2-2b-it/`
+        3. 必要ファイル:
+           - `config.json`
+           - `model-*.safetensors` (複数ファイル)
+           - `model.safetensors.index.json`  
+           - `tokenizer.json` または `tokenizer.model`
+        
+        #### **ELYZA Japanese 8B**:
+        1. [HuggingFace](https://huggingface.co/elyza/Llama-3-ELYZA-JP-8B) からダウンロード
+        2. 以下のディレクトリに配置: `./models/Llama-3-ELYZA-JP-8B/`
+        """)
     
     # ハイパーパラメータ設定
     st.subheader("⚙️ ハイパーパラメータ設定")
@@ -525,6 +1025,49 @@ def quantization_page():
     
     quantizer = ModelQuantizer()
     
+    # ディスク容量管理セクション
+    st.subheader("💾 ディスク容量管理")
+    
+    # ディスク容量表示
+    disk_info = get_disk_usage()
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("使用容量", f"{disk_info['used_gb']:.1f} GB")
+    with col2:
+        st.metric("空き容量", f"{disk_info['free_gb']:.1f} GB")
+    with col3:
+        capacity_color = "🔴" if disk_info['usage_percent'] > 95 else "🟡" if disk_info['usage_percent'] > 85 else "🟢"
+        st.metric("使用率", f"{capacity_color} {disk_info['usage_percent']:.1f}%")
+    
+    # 容量不足警告
+    if disk_info['free_gb'] < 5:
+        st.warning(f"⚠️ 空き容量が{disk_info['free_gb']:.1f}GBです。量子化には最低5GB必要です。")
+        
+        # クリーンアップ機能
+        with st.expander("🧹 ディスククリーンアップ", expanded=True):
+            st.markdown("""
+            **以下のクリーンアップを実行してディスク容量を確保できます：**
+            """)
+            
+            cleanup_col1, cleanup_col2 = st.columns(2)
+            
+            with cleanup_col1:
+                if st.button("🐳 Dockerクリーンアップ", help="未使用のDockerイメージ・コンテナ・ボリュームを削除"):
+                    cleanup_docker()
+                
+                if st.button("🗂️ 一時ファイル削除", help="ログファイル、キャッシュファイルなどを削除"):
+                    cleanup_temp_files()
+            
+            with cleanup_col2:
+                if st.button("📦 量子化ファイル整理", help="古い量子化ファイルや失敗したファイルを削除"):
+                    cleanup_quantization_files()
+                
+                if st.button("🔄 容量再確認", help="ディスク使用量を最新状態に更新"):
+                    st.rerun()
+    
+    st.divider()
+    
     # llama.cpp状態チェック
     st.subheader("🔧 llama.cpp 状態")
     
@@ -532,12 +1075,65 @@ def quantization_page():
         st.success("✅ llama.cpp が利用可能です")
     else:
         st.error("❌ llama.cpp が見つかりません")
-        st.markdown("""
-        **セットアップが必要です:**
-        ```bash
-        ./setup.sh
-        ```
-        """)
+        
+        with st.expander("📋 解決方法（初心者向け）", expanded=True):
+            st.warning("**量子化にはllama.cppのセットアップが必要です**")
+            
+            st.markdown("""
+            ### 🛠️ 自動セットアップ手順:
+            
+            #### **方法1: 自動セットアップスクリプト（推奨）**
+            以下のボタンを押すと自動でllama.cppをセットアップします：
+            """)
+            
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                if st.button("🔧 自動セットアップ実行", type="primary"):
+                    with st.spinner("llama.cppをセットアップ中..."):
+                        try:
+                            # 自動セットアップを実行
+                            import subprocess
+                            result = subprocess.run(
+                                ["bash", "./setup.sh"], 
+                                capture_output=True, 
+                                text=True,
+                                timeout=600  # 10分タイムアウト
+                            )
+                            
+                            if result.returncode == 0:
+                                st.success("✅ セットアップ完了！ページを更新してください")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ セットアップ失敗: {result.stderr}")
+                                
+                        except subprocess.TimeoutExpired:
+                            st.error("❌ セットアップがタイムアウトしました（10分）")
+                        except Exception as e:
+                            st.error(f"❌ セットアップエラー: {e}")
+            
+            with col2:
+                if st.button("🔄 状態を再確認"):
+                    st.rerun()
+            
+            st.markdown("""
+            #### **方法2: 手動実行（上級者向け）**
+            ターミナルで以下のコマンドを実行してください：
+            ```bash
+            cd /Users/matsbaccano/Projects/clone/mlx-finetuning
+            ./setup.sh
+            ```
+            
+            #### **📋 setup.shの処理内容:**
+            - Homebrewの確認・インストール
+            - Minicondaの確認・インストール  
+            - llama.cppのクローンとビルド
+            - Ollamaのインストール
+            - 必要な依存関係の設定
+            
+            #### **⏱️ 所要時間:**
+            初回セットアップ: 約5-15分（ネットワーク速度による）
+            """)
+        
         return
     
     # 量子化方法の説明
@@ -917,15 +1513,125 @@ def ollama_page():
             format_func=lambda x: "選択してください" if x == '' else x
         )
         
-        if model_to_delete and st.button("🗑️ モデル削除", type="secondary"):
-            if st.checkbox("削除を確認します"):
-                result = integrator.delete_model(model_to_delete)
+        if model_to_delete:
+            # 削除確認チェックボックスを先に表示
+            confirm_delete = st.checkbox(f"「{model_to_delete}」の削除を確認します")
+            
+            if confirm_delete and st.button("🗑️ モデル削除", type="secondary"):
+                with st.spinner("モデル削除中..."):
+                    result = integrator.delete_model(model_to_delete)
+                    
+                    if result['success']:
+                        st.success(f"✅ {result['message']}")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {result['error']}")
+    
+    # ===============================
+    # ✅ モデル転送用tarボール作成
+    # ===============================
+    st.header("📦 モデル転送")
+    st.write("ファインチューニング済みモデルを他のPCに転送するためのアーカイブを作成します。")
+    
+    # 利用可能な実験を取得
+    experiment_tracker = ExperimentTracker()
+    experiments = experiment_tracker.list_experiments()
+    completed_experiments = [exp for exp in experiments if exp.get('status') == 'completed']
+    
+    if completed_experiments:
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            selected_exp = st.selectbox(
+                "転送する実験を選択",
+                options=completed_experiments,
+                format_func=lambda x: f"{x['id'][:8]} - {x.get('model_name', 'unknown')}"
+            )
+        
+        with col2:
+            output_name = st.text_input(
+                "アーカイブ名", 
+                value=f"finetuned-model-{selected_exp['id'][:8]}"
+            )
+        
+        if st.button("📦 転送用アーカイブ作成", type="primary"):
+            with st.spinner("アーカイブ作成中..."):
+                archive_result = create_transfer_archive(selected_exp['id'], output_name)
                 
-                if result['success']:
-                    st.success(f"✅ {result['message']}")
+                if archive_result['success']:
+                    st.success(f"✅ アーカイブ作成完了: {archive_result['archive_path']}")
+                    st.info(f"📏 ファイルサイズ: {archive_result['size_mb']:.1f} MB")
+                    
+                    # 転送手順を表示
+                    st.subheader("📋 転送手順")
+                    transfer_commands = f"""# 1. 転送先PCにファイルをコピー
+scp {archive_result['archive_path']} user@target-pc:/path/to/destination/
+
+# 2. 転送先PCでアーカイブを展開
+tar -xzf {archive_result['filename']}
+
+# 3. Ollamaモデルを作成
+ollama create my-finetuned-model -f <(cat <<EOF
+FROM ./models/quantized/{archive_result['gguf_filename']}
+
+SYSTEM "あなたは親切で知識豊富な日本語アシスタントです。ユーザーの質問に対して、正確で有益な回答を日本語で提供してください。回答は分かりやすく簡潔にまとめ、必要に応じて具体例を示してください。"
+
+PARAMETER temperature 0.7
+PARAMETER top_p 0.9
+PARAMETER num_ctx 4096
+PARAMETER repeat_penalty 1.1
+EOF
+)"""
+                    st.code(transfer_commands, language="bash")
+                else:
+                    st.error(f"❌ アーカイブ作成エラー: {archive_result['error']}")
+    else:
+        st.info("📋 転送可能な完了済み実験がありません")
+    
+    # ===============================
+    # 🧹 ストレージクリーンアップ
+    # ===============================
+    st.header("🧹 ストレージクリーンアップ")
+    st.write("ファインチューニング結果ファイルを削除してストレージ容量を確保します。")
+    
+    # ストレージ使用量を取得
+    cleanup_info = get_cleanup_info()
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("ファインチューニング結果", f"{cleanup_info['finetuned_size_gb']:.2f} GB")
+    with col2:
+        st.metric("量子化ファイル", f"{cleanup_info['quantized_size_gb']:.2f} GB")
+    with col3:
+        st.metric("実験データ", f"{cleanup_info['experiments_size_gb']:.2f} GB")
+    
+    st.warning("⚠️ HuggingFaceベースモデル（gemma-2-2b-it等）は削除されません。")
+    
+    # クリーンアップオプション
+    cleanup_options = st.multiselect(
+        "削除対象を選択",
+        [
+            "ファインチューニング結果 (models/finetuned/)",
+            "量子化ファイル (models/quantized/)",
+            "実験データ (experiments/)",
+            "MLXキャッシュ (models/cache/)",
+            "GGUFキャッシュ (models/gguf_cache/)"
+        ],
+        default=["ファインチューニング結果 (models/finetuned/)", "量子化ファイル (models/quantized/)"]
+    )
+    
+    if cleanup_options:
+        confirm_cleanup = st.checkbox("⚠️ 削除を確認します（この操作は取り消せません）")
+        
+        if confirm_cleanup and st.button("🗑️ クリーンアップ実行", type="secondary"):
+            with st.spinner("クリーンアップ実行中..."):
+                cleanup_result = perform_cleanup(cleanup_options)
+                
+                if cleanup_result['success']:
+                    st.success(f"✅ クリーンアップ完了: {cleanup_result['freed_gb']:.2f} GB 削除")
                     st.rerun()
                 else:
-                    st.error(f"❌ {result['error']}")
+                    st.error(f"❌ クリーンアップエラー: {cleanup_result['error']}")
 
 
 def experiments_page():

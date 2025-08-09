@@ -1,22 +1,4 @@
 base_models:
-  elyza-8b:
-    name: "elyza/Llama-3-ELYZA-JP-8B"
-    display_name: "ELYZA Japanese 8B"
-    size_gb: 16
-    context_length: 8192
-    language: "ja"
-    recommended_batch_size: 1
-    description: "日本語に特化したLlama-3ベースのモデル"
-    
-  gemma2-9b:
-    name: "google/gemma-2-9b-it"
-    display_name: "Gemma 2 9B Instruct"
-    size_gb: 18
-    context_length: 8192
-    language: "multilingual"
-    recommended_batch_size: 1
-    description: "Googleの最新Gemma2モデル（命令調整済み）"
-    
   gemma2-2b:
     name: "google/gemma-2-2b-it"
     display_name: "Gemma 2 2B Instruct"
@@ -26,14 +8,14 @@ base_models:
     recommended_batch_size: 2
     description: "軽量版Gemma2モデル（命令調整済み）"
     
-  llama3-8b:
-    name: "meta-llama/Llama-3.1-8B-Instruct"
-    display_name: "Llama 3.1 8B Instruct"
+  elyza-8b:
+    name: "elyza/Llama-3-ELYZA-JP-8B"
+    display_name: "ELYZA Japanese 8B"
     size_gb: 16
-    context_length: 128000
-    language: "multilingual"
+    context_length: 8192
+    language: "ja"
     recommended_batch_size: 1
-    description: "Meta社のLlama 3.1命令調整モデル"
+    description: "日本語に特化したLlama-3ベースのモデル"
 
 task_types:
   qa:

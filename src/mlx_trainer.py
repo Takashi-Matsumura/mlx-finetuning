@@ -44,124 +44,97 @@ class MLXFineTuner:
             if key not in self.config:
                 self.config[key] = value
     
-    def download_and_convert_model(
+    def validate_and_convert_local_model(
         self, 
         model_name: str, 
         output_dir: str,
         status_callback: Optional[Callable] = None
     ) -> Tuple[bool, str]:
-        """HuggingFace モデルをダウンロードしてMLX形式に変換"""
+        """ローカルモデルファイルの検証とMLX形式への変換"""
         
         try:
             # ローカルモデルファイルの存在チェック
             local_model_path = Path(f"./models/{model_name.split('/')[-1]}")
-            if local_model_path.exists():
-                # 必要なファイルが存在するかチェック
-                required_files = ["config.json", "tokenizer.model", "model.safetensors.index.json"]
-                safetensors_files = list(local_model_path.glob("model-*.safetensors"))
-                
-                if all((local_model_path / f).exists() for f in required_files) and len(safetensors_files) > 0:
-                    self.logger.info(f"ローカルモデルを使用: {local_model_path}")
-                    if status_callback:
-                        status_callback(f"✅ ローカルモデル '{model_name}' を使用")
-                    
-                    # MLX形式の出力ディレクトリ（タイムスタンプでユニーク化）
-                    import time
-                    timestamp = str(int(time.time()))
-                    mlx_model_dir = Path(output_dir) / f"mlx_model_{timestamp}"
-                    
-                    # 既存のディレクトリがあれば削除（より確実に）
-                    if mlx_model_dir.exists():
-                        import shutil
-                        self.logger.info(f"既存のモデルディレクトリを削除: {mlx_model_dir}")
-                        shutil.rmtree(mlx_model_dir, ignore_errors=True)
-                        
-                    # 親ディレクトリも存在しない場合は作成
-                    mlx_model_dir.parent.mkdir(parents=True, exist_ok=True)
-                    
-                    # ローカルモデルからMLX形式に変換
-                    if status_callback:
-                        status_callback(f"🔄 ローカルモデルをMLX形式に変換中...")
-                    
-                    try:
-                        convert(
-                            hf_path=str(local_model_path),
-                            mlx_path=str(mlx_model_dir),
-                            quantize=False,  # 量子化はしない（ファインチューニング用）
-                            dtype="float16"  # メモリ効率のためfp16を使用
-                        )
-                        
-                        if status_callback:
-                            status_callback("✅ MLX変換完了")
-                        
-                        self.logger.info(f"ローカルモデル変換完了: {mlx_model_dir}")
-                        return True, str(mlx_model_dir)
-                        
-                    except Exception as convert_error:
-                        self.logger.warning(f"ローカルモデル変換エラー: {convert_error}")
-                        # フォールバックでダウンロードを試行
             
             if status_callback:
-                status_callback(f"🔄 モデル '{model_name}' をダウンロード中...")
+                status_callback(f"📁 ローカルモデルファイルを確認中: {local_model_path}")
             
-            # モデルキャッシュディレクトリ
-            cache_dir = Path("./models/cache")
-            cache_dir.mkdir(parents=True, exist_ok=True)
+            if not local_model_path.exists():
+                error_msg = f"❌ モデルディレクトリが見つかりません: {local_model_path}"
+                self.logger.error(error_msg)
+                if status_callback:
+                    status_callback(error_msg)
+                return False, f"モデルディレクトリが存在しません: {local_model_path}"
+            
+            # 必要なファイルが存在するかチェック
+            required_files = [
+                "config.json", 
+                "model.safetensors.index.json"
+            ]
+            
+            # トークナイザーファイルの確認（どちらか一方があればOK）
+            tokenizer_files = ["tokenizer.json", "tokenizer.model"]
+            has_tokenizer = any((local_model_path / f).exists() for f in tokenizer_files)
+            
+            # safetensorsファイルの確認
+            safetensors_files = list(local_model_path.glob("model-*.safetensors"))
+            
+            # ファイル検証
+            missing_files = []
+            for file in required_files:
+                if not (local_model_path / file).exists():
+                    missing_files.append(file)
+            
+            if not has_tokenizer:
+                missing_files.append("tokenizer.json または tokenizer.model")
+            
+            if len(safetensors_files) == 0:
+                missing_files.append("model-*.safetensors")
+            
+            if missing_files:
+                error_msg = f"❌ 必要なファイルが不足: {', '.join(missing_files)}"
+                self.logger.error(error_msg)
+                if status_callback:
+                    status_callback(error_msg)
+                return False, f"必要なファイルが不足しています: {missing_files}"
+            
+            self.logger.info(f"✅ ローカルモデル検証完了: {local_model_path}")
+            if status_callback:
+                status_callback(f"✅ ローカルモデル '{model_name}' を検証完了")
             
             # MLX形式の出力ディレクトリ（タイムスタンプでユニーク化）
             import time
             timestamp = str(int(time.time()))
             mlx_model_dir = Path(output_dir) / f"mlx_model_{timestamp}"
             
-            # 既存のディレクトリがあれば削除（より確実に）
+            # 既存のディレクトリがあれば削除
             if mlx_model_dir.exists():
                 import shutil
                 self.logger.info(f"既存のモデルディレクトリを削除: {mlx_model_dir}")
                 shutil.rmtree(mlx_model_dir, ignore_errors=True)
                 
-            # 親ディレクトリも存在しない場合は作成
+            # 親ディレクトリ作成
             mlx_model_dir.parent.mkdir(parents=True, exist_ok=True)
             
-            self.logger.info(f"モデルダウンロード開始: {model_name}")
+            # ローカルモデルからMLX形式に変換
+            if status_callback:
+                status_callback(f"🔄 ローカルモデルをMLX形式に変換中...")
+            
+            convert(
+                hf_path=str(local_model_path),
+                mlx_path=str(mlx_model_dir),
+                quantize=False,  # 量子化はしない（ファインチューニング用）
+                dtype="float16"  # メモリ効率のためfp16を使用
+            )
             
             if status_callback:
-                status_callback("📥 HuggingFaceからモデルをダウンロード中...")
+                status_callback("✅ MLX変換完了")
             
-            # MLX-LMのconvert関数を使用してHuggingFaceモデルを変換
-            try:
-                # モデル名の調整
-                if model_name == 'microsoft/DialoGPT-small':
-                    # GPT-2ベースの軽量モデルを代わりに使用
-                    model_name = 'gpt2'
-                elif model_name == 'google/gemma-2-2b-it':
-                    # Gemma2:2bモデルはそのまま使用
-                    pass
-                
-                if status_callback:
-                    status_callback(f"📥 モデル '{model_name}' を変換中...")
-                
-                convert(
-                    hf_path=model_name,
-                    mlx_path=str(mlx_model_dir),
-                    quantize=False,  # 量子化はしない（ファインチューニング用）
-                    dtype="float16"  # メモリ効率のためfp16を使用
-                )
-                
-                if status_callback:
-                    status_callback("✅ モデル変換完了")
-                
-                self.logger.info(f"モデル変換完了: {mlx_model_dir}")
-                return True, str(mlx_model_dir)
-                
-            except Exception as convert_error:
-                error_msg = f"モデル変換エラー: {str(convert_error)}"
-                self.logger.error(error_msg)
-                if status_callback:
-                    status_callback(f"❌ {error_msg}")
-                return False, error_msg
-                
+            self.logger.info(f"ローカルモデル変換完了: {mlx_model_dir}")
+            return True, str(mlx_model_dir)
+                    
         except Exception as e:
-            error_msg = f"モデルダウンロードエラー: {str(e)}"
+            error_msg = f"ローカルモデル処理エラー: {str(e)}"
             self.logger.error(error_msg)
             if status_callback:
                 status_callback(f"❌ {error_msg}")
@@ -337,11 +310,11 @@ class MLXFineTuner:
         """実際のMLXファインチューニングを実行"""
         
         try:
-            # ステップ1: モデルダウンロードと変換
+            # ステップ1: ローカルモデルの検証と変換
             if status_callback:
-                status_callback("🔄 モデルダウンロードと変換...")
+                status_callback("🔄 ローカルモデルの検証と変換...")
             
-            success, model_path = self.download_and_convert_model(
+            success, model_path = self.validate_and_convert_local_model(
                 model_name, output_dir, status_callback
             )
             

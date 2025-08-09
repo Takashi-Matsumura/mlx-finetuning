@@ -344,6 +344,7 @@ class ModelQuantizer:
             # 量子化コマンド（セットアップで検出されたパスを使用）
             cmd = [
                 str(self.quantize_executable),
+                "--allow-requantize",  # 既に量子化済みのモデルの再量子化を許可
                 str(gguf_path),
                 str(output_path),
                 quantization_method
