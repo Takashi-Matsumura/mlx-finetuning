@@ -19,6 +19,7 @@ from src.ollama_integration import OllamaIntegrator
 from src.experiment_tracker import ExperimentTracker
 from src.utils.memory_monitor import MemoryMonitor
 from src.utils.validators import validate_all
+from src.smart_recommender import SmartParameterRecommender
 from typing import Dict, Any, List
 
 
@@ -512,6 +513,101 @@ def dataset_page():
     """データセット準備ページ"""
     st.title("📊 データセット準備")
     
+    # 既存ディレクトリ管理セクション
+    st.subheader("🗂️ データセットディレクトリ管理")
+    
+    processed_data_dir = Path("./data/processed")
+    
+    if processed_data_dir.exists():
+        # 既存ディレクトリの一覧取得
+        dataset_dirs = [d for d in processed_data_dir.iterdir() if d.is_dir()]
+        
+        if dataset_dirs:
+            # ディレクトリ情報を表示
+            dir_info = []
+            for dir_path in dataset_dirs:
+                # ファイル数とサイズを計算
+                file_count = sum(1 for f in dir_path.rglob('*') if f.is_file())
+                total_size = sum(f.stat().st_size for f in dir_path.rglob('*') if f.is_file())
+                total_size_mb = total_size / (1024 * 1024)
+                
+                # 作成日時を取得
+                creation_time = datetime.fromtimestamp(dir_path.stat().st_ctime)
+                
+                dir_info.append({
+                    'ディレクトリ名': dir_path.name,
+                    'ファイル数': file_count,
+                    'サイズ(MB)': f"{total_size_mb:.1f}",
+                    '作成日時': creation_time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'パス': str(dir_path)
+                })
+            
+            # データフレームで表示
+            df = pd.DataFrame(dir_info)
+            st.dataframe(df.drop('パス', axis=1), use_container_width=True)
+            
+            # 削除機能
+            with st.expander("🗑️ ディレクトリ削除", expanded=False):
+                selected_dirs = st.multiselect(
+                    "削除するディレクトリを選択",
+                    options=[info['ディレクトリ名'] for info in dir_info],
+                    help="複数選択可能です。削除したディレクトリは復元できません。"
+                )
+                
+                if selected_dirs:
+                    # 削除対象の詳細情報
+                    total_size_to_delete = sum(
+                        float(info['サイズ(MB)']) for info in dir_info 
+                        if info['ディレクトリ名'] in selected_dirs
+                    )
+                    total_files_to_delete = sum(
+                        info['ファイル数'] for info in dir_info 
+                        if info['ディレクトリ名'] in selected_dirs
+                    )
+                    
+                    st.warning(f"⚠️ 削除予定: {len(selected_dirs)}個のディレクトリ、{total_files_to_delete}個のファイル、{total_size_to_delete:.1f}MB")
+                    
+                    # 確認チェックボックス
+                    confirm_delete = st.checkbox(
+                        "上記のディレクトリを完全に削除することを確認します",
+                        key="confirm_dataset_delete"
+                    )
+                    
+                    if confirm_delete:
+                        if st.button("🗑️ 選択したディレクトリを削除", type="secondary"):
+                            deleted_count = 0
+                            deleted_size = 0
+                            
+                            with st.spinner("ディレクトリを削除中..."):
+                                for dir_name in selected_dirs:
+                                    dir_path = processed_data_dir / dir_name
+                                    if dir_path.exists():
+                                        try:
+                                            # サイズを記録してから削除
+                                            size_mb = float(next(
+                                                info['サイズ(MB)'] for info in dir_info 
+                                                if info['ディレクトリ名'] == dir_name
+                                            ))
+                                            
+                                            shutil.rmtree(dir_path)
+                                            deleted_count += 1
+                                            deleted_size += size_mb
+                                            
+                                        except Exception as e:
+                                            st.error(f"❌ {dir_name} の削除に失敗: {e}")
+                            
+                            if deleted_count > 0:
+                                st.success(f"✅ {deleted_count}個のディレクトリを削除しました（{deleted_size:.1f}MB削除）")
+                                st.rerun()
+                            else:
+                                st.error("❌ ディレクトリの削除に失敗しました")
+        else:
+            st.info("📁 処理済みデータセットディレクトリはありません")
+    else:
+        st.info("📁 data/processedディレクトリが存在しません")
+    
+    st.divider()
+    
     # サンプルファイル選択オプション
     st.subheader("📁 ファイル選択")
     
@@ -662,6 +758,39 @@ def dataset_page():
                         with col3:
                             st.metric("フォーマット後", f"{result['formatted_items']} 件")
                         
+                        # データセットサイズの推奨表示
+                        train_count = result['splits']['train']
+                        if train_count > 20:
+                            st.warning("⚠️ **データセット最適化推奨**")
+                            st.markdown("""
+                            **ファインチューニング効率のための推奨事項:**
+                            - 📊 **最適サイズ**: 10-20件が効果的
+                            - 🎯 **現在のサイズ**: {}件（やや多め）
+                            - 💡 **推奨**: 最も重要な10-15件に絞り込むと学習効率が向上します
+                            - ✨ **利点**: 学習が深く、特定情報への回答精度が向上
+                            """.format(train_count))
+                        elif train_count >= 10:
+                            st.info("✅ **データセットサイズ良好**")
+                            st.markdown("""
+                            **現在のデータセットサイズ: {}件**
+                            - 🎯 ファインチューニングに最適なサイズです
+                            - 📈 効果的な学習が期待できます
+                            """.format(train_count))
+                        elif train_count >= 5:
+                            st.info("ℹ️ **小規模データセット**")
+                            st.markdown("""
+                            **現在のデータセットサイズ: {}件**
+                            - 📝 少数精鋭のデータセットです
+                            - 🚀 高い学習率と多くのイテレーションで効果的
+                            """.format(train_count))
+                        else:
+                            st.warning("⚠️ **データセット不足**")
+                            st.markdown("""
+                            **現在のデータセットサイズ: {}件（少なすぎます）**
+                            - 📈 **推奨**: 最低5-10件のデータを準備してください
+                            - 🎯 **品質重視**: 少数でも正確なデータが重要です
+                            """.format(train_count))
+                        
                         # 分割結果
                         st.write("**データ分割結果**")
                         splits_df = pd.DataFrame([
@@ -670,6 +799,25 @@ def dataset_page():
                             {'分割': 'テスト', '件数': result['splits']['test']}
                         ])
                         st.dataframe(splits_df, use_container_width=True)
+                        
+                        # ファインチューニング推奨パラメータ
+                        if train_count <= 10:
+                            st.info("🎯 **推奨ファインチューニング設定（小規模データセット用）**")
+                            recommended_col1, recommended_col2 = st.columns(2)
+                            with recommended_col1:
+                                st.markdown("""
+                                **基本設定:**
+                                - エポック数: 5-8
+                                - 学習率: 1e-4 ～ 2e-4
+                                - バッチサイズ: 1-2
+                                """)
+                            with recommended_col2:
+                                st.markdown("""
+                                **期待される効果:**
+                                - より深い学習
+                                - 特定情報への正確な回答
+                                - 過学習リスクの軽減
+                                """)
                         
                         # 出力パス表示
                         st.info(f"📁 出力ディレクトリ: {output_dir}")
@@ -847,23 +995,84 @@ def training_page():
     # ハイパーパラメータ設定
     st.subheader("⚙️ ハイパーパラメータ設定")
     
+    # スマート推奨機能
+    if selected_dataset_dir:
+        with st.expander("🧠 AI推奨設定", expanded=True):
+            try:
+                from src.smart_recommender import SmartParameterRecommender
+                recommender = SmartParameterRecommender()
+                
+                # データセットパスを取得
+                train_file_path = str(selected_dataset_dir / "train.jsonl")
+                
+                # 推奨パラメータを取得
+                recommendation = recommender.recommend_training_parameters(train_file_path)
+                
+                col_rec1, col_rec2 = st.columns([2, 1])
+                with col_rec1:
+                    st.info(f"💡 **推奨理由**: {recommendation['rationale']}")
+                    st.write(f"⏱️ **予想実行時間**: {recommendation['estimated_time_minutes']:.1f}分")
+                    st.write(f"🔄 **予想イテレーション数**: {recommendation['estimated_iterations']:,}回")
+                with col_rec2:
+                    apply_ai_recommendations = st.checkbox("AI推奨設定を適用", value=True, key="training_ai_rec")
+                
+                # 信頼度表示
+                confidence_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}
+                st.write(f"**信頼度**: {confidence_color.get(recommendation['confidence_level'], '❓')} {recommendation['confidence_level']}")
+                
+            except Exception as e:
+                st.warning(f"AI推奨機能の読み込みに失敗: {e}")
+                apply_ai_recommendations = False
+                recommendation = None
+    else:
+        apply_ai_recommendations = False
+        recommendation = None
+    
     with st.expander("基本設定", expanded=True):
+        # デフォルト値を設定（AI推奨が有効な場合はそれを使用）
+        default_batch_size = 1
+        default_learning_rate = 5e-5
+        default_epochs = 3
+        default_lora_rank = 16
+        default_lora_alpha = 32
+        default_lora_dropout = 0.1
+        
+        if apply_ai_recommendations and recommendation:
+            params = recommendation.get('parameters', {})
+            default_batch_size = params.get('batch_size', 1)
+            default_learning_rate = params.get('learning_rate', 5e-5)
+            default_epochs = params.get('num_epochs', 3)
+            default_lora_rank = params.get('lora_rank', 16)
+            default_lora_alpha = params.get('lora_alpha', 32)
+            default_lora_dropout = params.get('lora_dropout', 0.1)
+        
         col1, col2 = st.columns(2)
         
         with col1:
-            batch_size = st.selectbox("バッチサイズ", [1, 2, 4], index=0)
+            batch_size = st.selectbox("バッチサイズ", [1, 2, 4], 
+                                      index=[1, 2, 4].index(default_batch_size) if default_batch_size in [1, 2, 4] else 0)
+            
+            lr_options = [1e-5, 2e-5, 5e-5, 1e-4, 2e-4]
+            lr_index = 2  # デフォルトで5e-5
+            if default_learning_rate in lr_options:
+                lr_index = lr_options.index(default_learning_rate)
+            elif default_learning_rate > 1e-4:
+                lr_index = 4  # 2e-4を選択
+            elif default_learning_rate > 5e-5:
+                lr_index = 3  # 1e-4を選択
+                
             learning_rate = st.select_slider(
                 "学習率",
-                options=[1e-5, 2e-5, 5e-5, 1e-4, 2e-4],
-                value=5e-5,
+                options=lr_options,
+                value=lr_options[lr_index],
                 format_func=lambda x: f"{x:.0e}"
             )
-            num_epochs = st.slider("エポック数", 1, 10, 3)
+            num_epochs = st.slider("エポック数", 1, 15, min(default_epochs, 15))
         
         with col2:
-            lora_rank = st.slider("LoRA Rank", 4, 64, 16)
-            lora_alpha = st.slider("LoRA Alpha", 8, 128, 32)
-            lora_dropout = st.slider("LoRA Dropout", 0.0, 0.3, 0.1)
+            lora_rank = st.slider("LoRA Rank", 4, 64, min(default_lora_rank, 64))
+            lora_alpha = st.slider("LoRA Alpha", 8, 256, min(default_lora_alpha, 256))
+            lora_dropout = st.slider("LoRA Dropout", 0.0, 0.3, default_lora_dropout)
     
     with st.expander("詳細設定"):
         col1, col2 = st.columns(2)
@@ -923,10 +1132,20 @@ def training_page():
             if 'training_status' not in st.session_state:
                 st.session_state['training_status'] = "準備中..."
             
-            # プログレスバーとステータス表示
-            progress_bar = st.progress(st.session_state['training_progress'])
-            status_text = st.empty()
-            status_text.text(st.session_state['training_status'])
+            # プログレスバーとステータス表示  
+            progress_container = st.container()
+            with progress_container:
+                st.markdown("### 🚀 トレーニング進行状況")
+                progress_bar = st.progress(st.session_state['training_progress'])
+                progress_col1, progress_col2 = st.columns(2)
+                with progress_col1:
+                    st.metric("🔄 進行状況", f"{st.session_state['training_progress']*100:.1f}%")
+                with progress_col2:
+                    if 'training_current_loss' not in st.session_state:
+                        st.session_state['training_current_loss'] = 'N/A'
+                    st.metric("📊 現在のLoss", st.session_state['training_current_loss'])
+                
+                status_text = st.text_area("📝 ステータス", st.session_state['training_status'], height=100, disabled=True)
             
             # セッション状態を更新する関数（スレッドセーフ）
             def update_progress(progress):
@@ -950,73 +1169,114 @@ def training_page():
             except Exception as e:
                 st.error(f"❌ トレーニング開始エラー: {e}")
     
-    # 現在のトレーニング状況
+    # 現在のトレーニング状況（改善版）
+    st.subheader("🔍 トレーニング状況確認")
+    
+    # 最新の実験を自動取得
+    tracker = ExperimentTracker()
+    experiments = tracker.list_experiments()
+    
+    if experiments:
+        latest_experiment = experiments[0]
+        experiment_id = latest_experiment['id']
+        
+        # 実験状況表示
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            status = latest_experiment.get('status', 'unknown')
+            status_emoji = {"running": "🔄", "completed": "✅", "failed": "❌"}
+            st.metric("ステータス", f"{status_emoji.get(status, '❓')} {status}")
+            
+        with col2:
+            duration = latest_experiment.get('duration_seconds')
+            if duration:
+                duration_str = f"{duration:.1f}秒"
+            elif status == 'running':
+                import time
+                start_time = latest_experiment.get('started_at')
+                if start_time:
+                    from datetime import datetime
+                    start = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                    now = datetime.now(start.tzinfo)
+                    duration = (now - start).total_seconds()
+                    duration_str = f"{duration:.0f}秒経過"
+                else:
+                    duration_str = "実行中"
+            else:
+                duration_str = "N/A"
+            st.metric("実行時間", duration_str)
+            
+        with col3:
+            st.metric("実験ID", experiment_id[:8])
+        
+        # 進行状況バー（推定）
+        if status == 'running':
+            # 実行時間ベースで進行率を推定
+            estimated_total_time = 120  # 2分と推定
+            if duration:
+                progress = min(duration / estimated_total_time, 0.95)  # 最大95%まで
+            else:
+                progress = 0.1
+            
+            st.progress(progress, text=f"進行中... ({progress*100:.0f}%)")
+            
+            # リアルタイム更新ボタン
+            col_refresh1, col_refresh2 = st.columns(2)
+            with col_refresh1:
+                if st.button("🔄 状況更新", type="secondary"):
+                    st.rerun()
+            with col_refresh2:
+                # 自動リフレッシュ（5秒間隔）
+                if st.button("⏸️ 自動更新停止", help="5秒ごとの自動更新を停止"):
+                    st.session_state['auto_refresh'] = False
+                    
+            # 自動リフレッシュ機能
+            if st.session_state.get('auto_refresh', True):
+                import time
+                time.sleep(5)
+                st.rerun()
+                
+        elif status == 'completed':
+            st.progress(1.0, text="完了 (100%)")
+            
+            # 完了時のアクション
+            col_action1, col_action2, col_action3 = st.columns(3)
+            with col_action1:
+                if st.button("📈 実験詳細"):
+                    st.switch_page("experiments")
+            with col_action2:
+                if st.button("📦 量子化へ"):
+                    st.switch_page("quantization")  
+            with col_action3:
+                if st.button("🤖 Ollama統合"):
+                    st.switch_page("Ollama統合")
+                    
+            # 最終メトリクス表示
+            final_metrics = latest_experiment.get('final_metrics', {})
+            if final_metrics:
+                st.subheader("📊 最終結果")
+                metric_col1, metric_col2 = st.columns(2)
+                with metric_col1:
+                    if 'final_loss' in final_metrics:
+                        st.metric("最終Loss", f"{final_metrics['final_loss']:.3f}")
+                with metric_col2:
+                    if 'perplexity' in final_metrics:
+                        st.metric("Perplexity", f"{final_metrics['perplexity']:.1f}")
+                        
+        elif status == 'failed':
+            st.progress(0.0, text="失敗")
+            st.error(f"❌ トレーニングが失敗しました: {latest_experiment.get('error', '不明なエラー')}")
+            
+    else:
+        st.info("📝 まだトレーニングが実行されていません")
+        
+    # トレーニング管理の状態リセット
     if st.session_state.get('training_manager'):
         status = st.session_state['training_manager'].get_training_status()
-        
-        if status['is_training']:
-            # 実験の状態をチェック
-            experiment_id = status['experiment_id']
-            if experiment_id:
-                experiment_info = ExperimentTracker().get_experiment(experiment_id)
-                
-                # 実験が完了している場合はトレーニング状態をリセット
-                if experiment_info and experiment_info.get('status') == 'completed':
-                    st.session_state['training_manager'].is_training = False
-                    st.session_state['training_manager'].current_experiment_id = None
-                    st.success(f"🎉 トレーニングが完了しました！実験ID: {experiment_id}")
-                    st.info("📈 実験履歴ページで詳細な結果を確認できます")
-                    st.rerun()
-                
-                elif experiment_info and experiment_info.get('status') == 'failed':
-                    st.session_state['training_manager'].is_training = False
-                    st.session_state['training_manager'].current_experiment_id = None
-                    st.error(f"❌ トレーニングが失敗しました。実験ID: {experiment_id}")
-                    st.rerun()
-                
-                else:
-                    # 実行中表示
-                    with st.container():
-                        st.info(f"🔄 トレーニング実行中... (実験ID: {experiment_id})")
-                        
-                        # 実験の進捗をリアルタイム表示
-                        if experiment_info:
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                duration = experiment_info.get('duration_seconds', 0)
-                                duration_str = f"{duration:.1f}秒" if duration is not None else "実行中"
-                                st.metric("実行時間", duration_str)
-                            with col2:
-                                exp_status = experiment_info.get('status', 'running')
-                                status_emoji = {"running": "🔄", "completed": "✅", "failed": "❌"}
-                                st.metric("ステータス", f"{status_emoji.get(exp_status, '❓')} {exp_status}")
-                        
-                        # 停止ボタン
-                        if st.button("⏹️ トレーニング停止"):
-                            st.session_state['training_manager'].stop_current_training()
-                            st.warning("⏹️ トレーニング停止要求を送信しました")
-                        
-                        # 自動リフレッシュ
-                        if st.button("🔄 状況更新"):
-                            st.rerun()
-        else:
-            # トレーニング非実行時の表示
-            if st.session_state.get('current_experiment_id'):
-                last_experiment_id = st.session_state['current_experiment_id']
-                experiment_info = ExperimentTracker().get_experiment(last_experiment_id)
-                
-                if experiment_info:
-                    if experiment_info.get('status') == 'completed':
-                        st.success(f"✅ 最新のトレーニングが完了しました！")
-                        st.info(f"実験ID: {last_experiment_id}")
-                        
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            if st.button("📈 実験詳細を見る"):
-                                st.switch_page("experiments")
-                        with col2:
-                            if st.button("📦 量子化に進む"):
-                                st.switch_page("quantization")
+        if not status['is_training'] and experiments and experiments[0].get('status') == 'completed':
+            # 完了状態を正しく認識させる
+            st.session_state['training_manager'].is_training = False
+            st.session_state['training_manager'].current_experiment_id = None
 
 
 def quantization_page():
@@ -1225,13 +1485,58 @@ def quantization_page():
     # 量子化設定
     st.subheader("⚙️ 量子化設定")
     
+    # スマート推奨機能
+    if selected_model_path and validation_result.get('is_valid'):
+        with st.expander("🧠 AI推奨設定", expanded=True):
+            try:
+                from src.smart_recommender import SmartParameterRecommender
+                recommender = SmartParameterRecommender()
+                
+                # モデルサイズ取得
+                model_size_gb = validation_result.get('model_size_gb', 2.0)
+                
+                # 用途選択UI
+                use_case = st.selectbox(
+                    "用途を選択（推奨設定の参考にします）",
+                    options=["高精度重視", "速度重視", "メモリ効率重視", "バランス重視"],
+                    index=3,  # バランス重視をデフォルト
+                    help="選択した用途に応じて最適な量子化方法を推奨します"
+                )
+                
+                # 推奨パラメータを取得
+                recommendation = recommender.recommend_quantization_parameters(model_size_gb, use_case)
+                
+                col_rec1, col_rec2 = st.columns([2, 1])
+                with col_rec1:
+                    st.info(f"💡 **推奨**: {recommendation['method']} - {recommendation['reason']}")
+                with col_rec2:
+                    apply_recommendations = st.checkbox("推奨設定を適用", value=True)
+                
+            except Exception as e:
+                st.warning(f"推奨機能の読み込みに失敗: {e}")
+                apply_recommendations = False
+    else:
+        apply_recommendations = False
+    
     col1, col2 = st.columns(2)
     
     with col1:
+        # 推奨設定が利用可能で適用される場合
+        if apply_recommendations and 'recommendation' in locals():
+            default_method = recommendation['method']
+            # デフォルトインデックスを計算
+            method_list = list(quant_info['available_methods'].keys())
+            try:
+                default_index = method_list.index(default_method)
+            except ValueError:
+                default_index = 1  # Q5_K_Mをデフォルト
+        else:
+            default_index = 1  # Q5_K_Mをデフォルト
+        
         quantization_method = st.selectbox(
             "量子化方法",
             options=list(quant_info['available_methods'].keys()),
-            index=1  # Q5_K_M をデフォルト
+            index=default_index
         )
         
         output_name = st.text_input(
@@ -1413,6 +1718,57 @@ def ollama_page():
         # パラメータ設定
         st.subheader("⚙️ パラメータ設定")
         
+        # スマート推奨機能
+        with st.expander("🧠 AI推奨設定", expanded=True):
+            try:
+                from src.smart_recommender import SmartParameterRecommender
+                recommender = SmartParameterRecommender()
+                
+                # ファインチューニング結果からデータセット情報を取得を試行
+                dataset_stats = {'total_samples': 10, 'has_specific_knowledge': True}  # デフォルト値
+                
+                # 実験IDからデータセット分析結果を取得する試行
+                if selected_gguf and hasattr(selected_gguf, 'name'):
+                    model_filename = selected_gguf.name
+                    # ファイル名から実験IDを抽出（例: mlx_model_1754767357-Q5_K_M.gguf -> 1754767357）
+                    import re
+                    experiment_match = re.search(r'mlx_model_(\d+)', model_filename)
+                    if experiment_match:
+                        experiment_timestamp = experiment_match.group(1)
+                        # 実験情報から元のデータセットパスを取得する試行
+                        from src.experiment_tracker import ExperimentTracker
+                        tracker = ExperimentTracker()
+                        try:
+                            # 最近の実験からデータセット統計情報を取得
+                            experiments = tracker.list_experiments()
+                            if experiments:
+                                latest_exp = experiments[0]  # 最新実験
+                                if 'dataset_analysis' in latest_exp.get('final_metrics', {}):
+                                    dataset_stats = latest_exp['final_metrics']['dataset_analysis']
+                        except:
+                            pass  # デフォルト値を使用
+                
+                # モデルタイプ推定（Gemmaの場合）
+                model_type = "gemma2"  
+                
+                # 推奨パラメータを取得
+                ollama_recommendation = recommender.recommend_ollama_parameters(model_type, dataset_stats)
+                
+                st.info(f"💡 **推奨設定**: データセット特性（{dataset_stats.get('total_samples', 'N/A')}件、特定知識{'あり' if dataset_stats.get('has_specific_knowledge') else 'なし'}）に基づく最適化")
+                
+                col_rec1, col_rec2 = st.columns([2, 1])
+                with col_rec1:
+                    temp_rec = ollama_recommendation.get('temperature', 0.7)
+                    top_p_rec = ollama_recommendation.get('top_p', 0.9)
+                    st.write(f"Temperature: {temp_rec}, Top-P: {top_p_rec}")
+                with col_rec2:
+                    apply_ollama_recommendations = st.checkbox("推奨設定を適用", value=True, key="ollama_rec")
+                
+            except Exception as e:
+                st.warning(f"推奨機能の読み込みに失敗: {e}")
+                apply_ollama_recommendations = False
+                ollama_recommendation = {'temperature': 0.7, 'top_p': 0.9, 'num_ctx': 4096, 'repeat_penalty': 1.1}
+        
         # 用途別プリセット
         use_cases = ['general', 'creative', 'precise', 'translation', 'coding']
         use_case = st.selectbox(
@@ -1427,34 +1783,40 @@ def ollama_page():
             }[x]
         )
         
-        # パラメータ最適化提案を取得
+        # パラメータ最適化提案を取得（従来の方法も併用）
         optimization = integrator.optimize_parameters(model_name, use_case)
         recommended = optimization['recommended_parameters']
+        
+        # AI推奨が有効な場合はそちらを優先
+        if apply_ollama_recommendations and 'ollama_recommendation' in locals():
+            final_recommendations = ollama_recommendation
+        else:
+            final_recommendations = recommended
         
         col1, col2 = st.columns(2)
         
         with col1:
             temperature = st.slider(
                 "Temperature",
-                0.0, 2.0, recommended['temperature'],
+                0.0, 2.0, final_recommendations.get('temperature', 0.7),
                 help="応答のランダム性"
             )
             top_p = st.slider(
                 "Top P",
-                0.0, 1.0, recommended['top_p'],
+                0.0, 1.0, final_recommendations.get('top_p', 0.9),
                 help="核サンプリング"
             )
         
         with col2:
             repeat_penalty = st.slider(
                 "Repeat Penalty",
-                1.0, 2.0, recommended['repeat_penalty'],
+                1.0, 2.0, final_recommendations.get('repeat_penalty', 1.1),
                 help="繰り返し抑制"
             )
             num_ctx = st.selectbox(
                 "Context Length",
                 options=[2048, 4096, 8192, 16384],
-                index=1,
+                index=1 if final_recommendations.get('num_ctx', 4096) == 4096 else 0,
                 help="コンテキスト長"
             )
         

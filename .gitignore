@@ -78,6 +78,7 @@ llama.cpp/
 logs/
 fused_model/
 data/raw/
+data/processed/
 company_data.csv
 
 # Streamlit

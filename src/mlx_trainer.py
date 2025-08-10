@@ -262,6 +262,38 @@ class MLXFineTuner:
             self.logger.error(f"データセット準備エラー: {e}")
             raise
     
+    def _get_dataset_size(self, dataset_file: str) -> int:
+        """データセットのサイズを取得"""
+        try:
+            with open(dataset_file, 'r', encoding='utf-8') as f:
+                return sum(1 for _ in f)
+        except Exception as e:
+            self.logger.warning(f"データセットサイズ取得エラー: {e}")
+            return 10  # デフォルト値
+    
+    def _verify_training_config(self, output_dir: str) -> Dict[str, Any]:
+        """トレーニングで実際に使用された設定を検証"""
+        try:
+            adapter_config_path = os.path.join(output_dir, "adapter_config.json")
+            if os.path.exists(adapter_config_path):
+                with open(adapter_config_path, 'r', encoding='utf-8') as f:
+                    actual_config = json.load(f)
+                
+                # 重要なパラメータを抽出
+                return {
+                    'iters': actual_config.get('iters', 'unknown'),
+                    'learning_rate': actual_config.get('learning_rate', 'unknown'),
+                    'batch_size': actual_config.get('batch_size', 'unknown'),
+                    'lora_rank': actual_config.get('lora_parameters', {}).get('rank', 'unknown'),
+                    'lora_scale': actual_config.get('lora_parameters', {}).get('scale', 'unknown'),
+                    'max_seq_length': actual_config.get('max_seq_length', 'unknown')
+                }
+            else:
+                return {'status': 'config_file_not_found'}
+        except Exception as e:
+            self.logger.warning(f"パラメータ検証エラー: {e}")
+            return {'status': 'verification_error', 'error': str(e)}
+    
     def compute_loss(
         self, 
         model: nn.Module, 
@@ -388,22 +420,47 @@ class MLXFineTuner:
             
             self.logger.info(f"データセットディレクトリ準備完了: {dataset_dir}")
             
-            # MLX-LMのファインチューニングコマンドを構築
+            # データセットサイズを動的に計算
+            dataset_size = self._get_dataset_size(train_file)
+            
+            # イテレーション数を正しく計算
+            # データセットサイズが小さい場合は、十分なイテレーション数を確保
+            epochs = self.config.get('num_epochs', 3)
+            if dataset_size <= 10:
+                # 小さなデータセットの場合は十分なイテレーション数
+                total_iters = max(200, epochs * dataset_size * 10)  # 最低200回
+            else:
+                total_iters = epochs * dataset_size
+            
+            # LoRA設定ファイルを作成
+            config_file = os.path.join(output_dir, "lora_config.yaml")
+            with open(config_file, 'w', encoding='utf-8') as f:
+                f.write(f"""# LoRA Fine-tuning Configuration
+model: {model_path}
+train: true
+data: {dataset_dir}
+fine_tune_type: lora
+batch_size: {self.config.get('batch_size', 1)}
+iters: {total_iters}
+learning_rate: {self.config.get('learning_rate', 5e-5)}
+steps_per_report: {self.config.get('logging_steps', 10)}
+save_every: {min(100, total_iters // 4)}
+adapter_path: {output_dir}
+max_seq_length: {self.config.get('max_seq_length', 2048)}
+val_batches: 0
+
+# LoRA Parameters
+lora_parameters:
+  rank: {self.config.get('lora_rank', 16)}
+  alpha: {self.config.get('lora_alpha', 32)}
+  dropout: {self.config.get('lora_dropout', 0.1)}
+  scale: {self.config.get('lora_alpha', 32) / self.config.get('lora_rank', 16)}
+""")
+            
+            # MLX-LMのファインチューニングコマンドを構築（設定ファイル使用）
             cmd = [
-                "python", "-m", "mlx_lm", "lora",  # 新しい推奨形式
-                "--model", model_path,
-                "--train",
-                "--data", dataset_dir,  # ディレクトリを指定
-                "--fine-tune-type", "lora",
-                "--batch-size", str(self.config.get('batch_size', 1)),
-                "--num-layers", "16",  # --lora-layers ではなく --num-layers
-                "--iters", str(self.config.get('num_epochs', 3) * 16),  # 16件のデータ × エポック数
-                "--learning-rate", str(self.config.get('learning_rate', 5e-5)),
-                "--steps-per-report", str(self.config.get('logging_steps', 10)),
-                "--save-every", str(self.config.get('save_steps', 100)),  # --steps-per-save ではなく --save-every
-                "--adapter-path", output_dir,  # --adapter-file ではなく --adapter-path (ディレクトリ)
-                "--max-seq-length", str(self.config.get('max_seq_length', 2048)),
-                "--val-batches", "0"  # 検証を無効にして高速化
+                "python", "-m", "mlx_lm", "lora",
+                "--config", config_file
             ]
             
             self.logger.info(f"実行コマンド: {' '.join(cmd)}")
@@ -418,7 +475,7 @@ class MLXFineTuner:
             )
             
             step_count = 0
-            total_steps = self.config.get('num_epochs', 3) * 16
+            total_steps = total_iters  # 正しい総ステップ数を使用
             
             # 出力を監視
             while True:
@@ -476,6 +533,9 @@ class MLXFineTuner:
                 if status_callback:
                     status_callback("🎉 ファインチューニング完了！")
                 
+                # パラメータ検証を実行
+                actual_config = self._verify_training_config(output_dir)
+                
                 # 実験完了を記録
                 adapter_file = os.path.join(output_dir, "adapters.safetensors")
                 self.experiment_tracker.complete_experiment(
@@ -484,7 +544,11 @@ class MLXFineTuner:
                     metrics={
                         'status': 'completed', 
                         'adapter_file': adapter_file,
-                        'final_step': step_count
+                        'final_step': step_count,
+                        'configured_params': self.config,
+                        'actual_params': actual_config,
+                        'total_iterations': total_iters,
+                        'dataset_size': dataset_size
                     }
                 )
                 
@@ -496,6 +560,18 @@ class MLXFineTuner:
             
         except Exception as e:
             error_msg = f"MLX-LMトレーニングエラー: {str(e)}"
+            self.logger.error(error_msg)
+            
+            # 実験を失敗として記録
+            self.experiment_tracker.fail_experiment(
+                experiment_id,
+                f"{error_msg} | Config: {self.config} | Command: {' '.join(cmd) if 'cmd' in locals() else 'N/A'}"
+            )
+            
+            if status_callback:
+                status_callback(f"❌ エラー: {error_msg}")
+            
+            raise RuntimeError(error_msg)
             self.logger.error(error_msg)
             if status_callback:
                 status_callback(f"❌ {error_msg}")
