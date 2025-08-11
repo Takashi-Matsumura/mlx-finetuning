@@ -99,6 +99,41 @@ def find_latest_finetuned_model():
         return fused_dir
     return None
 
+def create_model_archive(model_dir, archive_name):
+    """ファインチューニング済みモデルのアーカイブを作成"""
+    import tarfile
+    
+    try:
+        if not model_dir or not Path(model_dir).exists():
+            return {"success": False, "error": "モデルディレクトリが見つかりません"}
+        
+        model_path = Path(model_dir)
+        
+        # アーカイブファイル名とパスを設定
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_filename = f"{archive_name}_{timestamp}.tar.gz"
+        archive_path = Path.cwd() / archive_filename
+        
+        # tar.gzアーカイブを作成
+        with tarfile.open(archive_path, "w:gz") as tar:
+            # モデルディレクトリ全体をアーカイブに追加
+            # arcname でアーカイブ内でのディレクトリ名を設定
+            tar.add(model_path, arcname=archive_name)
+        
+        # ファイルサイズを取得
+        file_size = archive_path.stat().st_size
+        size_mb = file_size / (1024 * 1024)
+        size_str = f"{size_mb:.1f} MB"
+        
+        return {
+            "success": True,
+            "archive_path": str(archive_path),
+            "size": size_str
+        }
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 def init_session_state():
     """セッション状態の初期化"""
     if 'current_step' not in st.session_state:
@@ -1074,6 +1109,41 @@ def main():
                 
                 st.info(f"📁 ソースモデル: `{FUSED_MODEL_DIR}`")
                 st.info(f"📂 LM Studioディレクトリ: `{get_lmstudio_models_dir()}`")
+            
+            # モデルアーカイブ作成機能をcol2の最後に追加
+            latest_model_dir = find_latest_finetuned_model()
+            if latest_model_dir:
+                st.markdown("---")
+                st.subheader("📦 モデルアーカイブ作成")
+                st.info("他のPCでも使用できるよう、ファインチューニング済みモデルをアーカイブファイルに圧縮できます")
+                
+                col1_archive, col2_archive = st.columns([2, 1])
+                with col1_archive:
+                    archive_name = st.text_input(
+                        "モデル名", 
+                        value="my-custom-model", 
+                        help="アーカイブファイル名に使用されます（英数字とハイフンのみ）",
+                        key="archive_model_name"
+                    )
+                with col2_archive:
+                    if st.button("📦 アーカイブ作成", type="primary", key="create_archive"):
+                        if archive_name and archive_name.replace('-', '').replace('_', '').isalnum():
+                            with st.spinner("アーカイブ作成中... (数分かかる場合があります)"):
+                                result = create_model_archive(latest_model_dir, archive_name)
+                                if result["success"]:
+                                    st.success(f"✅ アーカイブが作成されました!")
+                                    st.code(f"📁 {result['archive_path']}")
+                                    st.info(f"📊 ファイルサイズ: {result['size']}")
+                                    st.markdown("""
+                                    **使用方法:**
+                                    1. このアーカイブファイルを他のPCにコピー
+                                    2. 解凍して任意のディレクトリに配置
+                                    3. LM Studioで解凍したディレクトリを指定してインポート
+                                    """)
+                                else:
+                                    st.error(f"❌ アーカイブ作成失敗: {result['error']}")
+                        else:
+                            st.error("❌ モデル名は英数字とハイフン・アンダースコアのみ使用できます")
     
     # Tab 4: テスト・デモ  
     with tab4:
