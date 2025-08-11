@@ -80,6 +80,7 @@ fused_model/
 data/raw/
 data/processed/
 company_data.csv
+works/
 
 # Streamlit
 .streamlit/

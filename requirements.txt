@@ -1,21 +1,22 @@
-streamlit==1.31.0
-mlx>=0.18.0
-mlx-lm>=0.18.0
-click>=8.1.0
-huggingface_hub>=0.20.0
+# MLX Fine-tuning Studio - 完全リニューアル版
+# 最小限の依存関係でシンプルな構成
+
+# Core Web Framework
+streamlit>=1.28.0
+
+# Data Processing
 pandas>=2.0.0
 numpy>=1.24.0
-pyyaml>=6.0
-regex>=2023.0.0
-watchdog>=4.0.0
-plotly>=5.17.0
+
+# API Communication
 requests>=2.31.0
-transformers>=4.36.0
-tokenizers>=0.15.0
-datasets>=2.16.0
-psutil>=5.9.0
-tqdm>=4.66.0
-accelerate>=0.25.0
-peft>=0.7.0
-bitsandbytes>=0.42.0
-scikit-learn>=1.3.0
+
+# Visualization
+plotly>=5.17.0
+
+# MLX Framework (Apple Silicon用)
+mlx>=0.10.0
+mlx-lm>=0.7.0
+
+# Development Tools (Optional)
+pytest>=7.4.0
