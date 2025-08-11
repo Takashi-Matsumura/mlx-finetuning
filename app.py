@@ -381,7 +381,7 @@ def prepare_dataset(uploaded_file, output_dir: Path):
         with open(train_file, 'w', encoding='utf-8') as f:
             for _, row in train_df.iterrows():
                 json_obj = {
-                    "text": f"### 指示:\\n{row['instruction']}\\n\\n### 回答:\\n{row['output']}"
+                    "text": f"<|user|>\\n{row['instruction']}<|end|>\\n<|assistant|>\\n{row['output']}<|end|>"
                 }
                 f.write(json.dumps(json_obj, ensure_ascii=False) + "\\n")
         
@@ -389,7 +389,7 @@ def prepare_dataset(uploaded_file, output_dir: Path):
         with open(valid_file, 'w', encoding='utf-8') as f:
             for _, row in valid_df.iterrows():
                 json_obj = {
-                    "text": f"### 指示:\\n{row['instruction']}\\n\\n### 回答:\\n{row['output']}"
+                    "text": f"<|user|>\\n{row['instruction']}<|end|>\\n<|assistant|>\\n{row['output']}<|end|>"
                 }
                 f.write(json.dumps(json_obj, ensure_ascii=False) + "\\n")
         
@@ -534,7 +534,7 @@ def run_actual_mlx_finetuning():
             with open(file_path, 'w', encoding='utf-8') as f:
                 for _, row in data_df.iterrows():
                     json_obj = {
-                        "text": f"### 指示:\n{row['instruction']}\n\n### 回答:\n{row['output']}"
+                        "text": f"<|user|>\n{row['instruction']}<|end|>\n<|assistant|>\n{row['output']}<|end|>"
                     }
                     f.write(json.dumps(json_obj, ensure_ascii=False) + "\n")
             add_log(f"✅ {description}ファイルを作成: {file_path}")
@@ -554,15 +554,25 @@ def run_actual_mlx_finetuning():
         # MLXファインチューニングコマンド (--dataはディレクトリを指定)
         cmd = f"""
         source {MLX_ENV} && 
-        python -m mlx_lm lora \
-            --model ./models/gemma-2-2b-it \
-            --train \
-            --data {processed_dir} \
-            --iters 50 \
-            --steps-per-report 10 \
-            --steps-per-eval 25 \
-            --adapter-path {adapters_dir} \
-            --batch-size 1
+        python -c "
+import yaml
+config = {{
+    'model': './models/gemma-2-2b-it',
+    'data': '{processed_dir}',
+    'train': True,
+    'adapter_path': '{adapters_dir}',
+    'iters': 200,
+    'learning_rate': 5e-5,
+    'steps_per_report': 10,
+    'steps_per_eval': 50,
+    'batch_size': 1,
+    'lora_parameters': {{'rank': 16, 'scale': 32.0, 'dropout': 0.0}},
+    'max_seq_length': 2048
+}}
+with open('{output_dir}/config.yaml', 'w') as f:
+    yaml.dump(config, f)
+" && \
+        python -m mlx_lm lora --config {output_dir}/config.yaml
         """
         
         add_log("💫 ファインチューニングプロセスを開始...")
