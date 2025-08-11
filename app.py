@@ -99,6 +99,60 @@ def find_latest_finetuned_model():
         return fused_dir
     return None
 
+def import_model_to_lm_studio(model_dir):
+    """ファインチューニング済みモデルをLM Studioにインポート"""
+    try:
+        if not model_dir or not Path(model_dir).exists():
+            return {"success": False, "error": "モデルディレクトリが見つかりません"}
+        
+        # LM Studioのモデルディレクトリを決定
+        lm_studio_models_dir = Path.home() / ".lmstudio" / "models" / "mlx-community"
+        
+        # モデル名を生成（タイムスタンプ付き）
+        timestamp = int(time.time())
+        model_name = f"finetuned-model-{timestamp}"
+        target_dir = lm_studio_models_dir / model_name
+        
+        # ディレクトリを作成
+        target_dir.mkdir(parents=True, exist_ok=True)
+        
+        # モデルファイルをコピー
+        model_path = Path(model_dir)
+        for file in model_path.iterdir():
+            if file.is_file():
+                shutil.copy2(file, target_dir / file.name)
+        
+        return {
+            "success": True,
+            "model_name": model_name,
+            "target_dir": str(target_dir),
+            "message": f"モデルを {model_name} としてLM Studioにインポートしました"
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"インポートエラー: {str(e)}"
+        }
+
+def load_model_in_lm_studio(model_name):
+    """LM Studioで指定されたモデルをロード"""
+    try:
+        response = requests.post(
+            "http://localhost:1234/v1/models/load",
+            headers={"Content-Type": "application/json"},
+            json={"path": f"mlx-community/{model_name}"},
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            return {"success": True, "message": f"モデル {model_name} をロードしました"}
+        else:
+            return {"success": False, "error": f"モデルロードに失敗: {response.status_code}"}
+            
+    except Exception as e:
+        return {"success": False, "error": f"モデルロードエラー: {str(e)}"}
+
 def create_model_archive(model_dir, archive_name):
     """ファインチューニング済みモデルのアーカイブを作成"""
     import tarfile
@@ -992,9 +1046,37 @@ def main():
                         size = file.stat().st_size / (1024**3)  # GB
                         st.write(f"📄 {file.name} ({size:.2f}GB)")
                 
-                # 次のステップを明確に表示
+                # LM Studioへのインポートボタン
                 st.markdown("---")
-                st.info("**次のステップ:** LM Studioにモデルをインポートして使用可能にします")
+                st.subheader("🚀 LM Studioへのインポート")
+                
+                if st.button("📁 ファインチューニング済みモデルをLM Studioにインポート", type="primary"):
+                    with st.spinner("LM Studioにモデルをインポート中..."):
+                        # Step 1: モデルをインポート
+                        result = import_model_to_lm_studio(latest_model_dir)
+                        
+                        if result["success"]:
+                            st.success(f"✅ {result['message']}")
+                            st.info(f"📍 インポート先: {result['target_dir']}")
+                            
+                            st.markdown("---")
+                            st.success("🎉 **インポート完了！**")
+                            st.markdown(f"""
+                            **✅ 完了済み:**
+                            - ✅ モデルのインポート (`{result['model_name']}`)
+                            - ✅ LM Studioで自動認識済み
+                            
+                            **⚠️ 重要: モデルを切り替えてください**
+                            1. LM Studioのローカルサーバーで `{result['model_name']}` を選択
+                            2. 元のベースモデル（gemma-2-2b-it）ではなく、新しいファインチューニング済みモデルを選択
+                            3. 「テスト・デモ」タブでファインチューニング結果を確認
+                            
+                            💡 **ファインチューニング済みモデルを選択しないと学習効果を確認できません！**
+                            """)
+                        else:
+                            st.error(f"❌ {result['error']}")
+                
+                st.info("💡 **ヒント:** インポート後、LM Studioでローカルサーバーを起動し、インポートされたモデルを選択してください")
             else:
                 st.error("❌ ファインチューニング済みモデルなし")
                 st.info("まず「MLXファインチューニング」タブでファインチューニングを実行してください")
